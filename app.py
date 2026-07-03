@@ -31,10 +31,41 @@ st.markdown(
     """
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap');
-    html, body, [class*="css"], .stApp, .stMarkdown, p, span, div, label,
+    /* Import the Material icon font ourselves with display=block: the icon text stays
+       INVISIBLE until the font loads, so the ligature word (e.g. keyboard_arrow_right)
+       can never flash as text or overlap. Guarantees the arrows render in any browser. */
+    @import url('https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,400,0,0&display=block');
+    @import url('https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,400,0,0&display=block');
+
+    /* Apply Poppins only to text elements. Do NOT target bare span/div or [class*=css]:
+       those directly match Streamlit's Material icon <span>s and would clobber the icon
+       font, printing the ligature name (e.g. keyboard_arrow_right). */
+    html, body, .stApp, .stMarkdown, p, label,
     h1, h2, h3, h4, h5, h6, button, input, textarea, select,
-    [data-testid="stMetricValue"], [data-testid="stMetricLabel"] {
+    .stMarkdown p, .stMarkdown li, .stMarkdown span,
+    [data-testid="stMetricValue"], [data-testid="stMetricLabel"],
+    [data-baseweb="tab"] div, [data-testid="stWidgetLabel"] {
         font-family: 'Poppins', sans-serif !important;
+    }
+
+    /* Canonical Material icon rendering — force ligature shaping so arrows/chevrons
+       render as glyphs (expander toggles, sidebar collapse, select dropdowns). */
+    [data-testid="stIconMaterial"], span.material-symbols-rounded,
+    span.material-symbols-outlined, span.material-icons {
+        font-family: 'Material Symbols Rounded', 'Material Symbols Outlined', 'Material Icons' !important;
+        font-weight: normal !important;
+        font-style: normal !important;
+        line-height: 1 !important;
+        letter-spacing: normal !important;
+        text-transform: none !important;
+        white-space: nowrap !important;
+        word-wrap: normal !important;
+        direction: ltr !important;
+        font-feature-settings: 'liga' !important;
+        -webkit-font-feature-settings: 'liga' !important;
+        font-variant-ligatures: normal !important;
+        overflow: hidden !important;      /* if the font ever fails, clip instead of overlap */
+        max-width: 1.5em !important;
     }
     h1, h2, h3, h4 { color: #23262B; font-weight: 600; letter-spacing: -0.01em; }
     h1 { font-weight: 700; }
