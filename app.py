@@ -1,0 +1,490 @@
+"""Equity TCA / Best-Execution dashboard.
+
+Framework-segregated: each tab is one cost lens (Arrival IS, VWAP, Participation,
+Bloomberg-TCA model, Market Impact, Difficulty-adjusted league, Efficient Frontier),
+with its own methodology, standardized visuals, and a broker breakdown so the
+frameworks can be compared side by side. Data is hardcoded for demo deployment.
+Analysis logic lives in the tested `tca` package; this file is presentation only.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+from tca.pipeline import run_parent_pipeline
+from tca.insights import attribution_by, attribution_summary, cost_by_participation, child_routes_for_broker
+from tca.tca_model import tca_component_decomposition, cost_surprise_by
+from tca.kissell import build_etf, decision_points, order_spec_from_row
+
+# ---------------------------------------------------------------------------
+# config + shared styling (standardized visuals)
+# ---------------------------------------------------------------------------
+st.set_page_config(page_title="CIGP — Equity TCA", layout="wide")
+
+# --- Poppins font + CIGP gold theme (injected CSS) -------------------------
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap');
+    html, body, [class*="css"], .stApp, .stMarkdown, p, span, div, label,
+    h1, h2, h3, h4, h5, h6, button, input, textarea, select,
+    [data-testid="stMetricValue"], [data-testid="stMetricLabel"] {
+        font-family: 'Poppins', sans-serif !important;
+    }
+    h1, h2, h3, h4 { color: #23262B; font-weight: 600; letter-spacing: -0.01em; }
+    h1 { font-weight: 700; }
+    [data-testid="stMetricValue"] { color: #8A6C28; font-weight: 600; }
+    [data-testid="stMetricLabel"] { color: #6B7280; }
+    .stTabs [data-baseweb="tab"] { font-weight: 500; }
+    .stTabs [aria-selected="true"] { color: #B08D3C !important; }
+    .stTabs [data-baseweb="tab-highlight"] { background-color: #B08D3C !important; }
+    [data-testid="stSidebar"] { background-color: #FAF6EC; border-right: 1px solid #E7DCC3; }
+    div.stButton > button, .stDownloadButton > button { border-color: #B08D3C; color: #8A6C28; }
+    a { color: #8A6C28; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+DATA_FILE = "data_trades_new2.csv"        # hardcoded for demo deployment
+CHILD_FILE = "180days_child_order_data.csv"
+
+# CIGP gold-centred palette (+ compatible bronze/champagne/teal/terracotta/burgundy)
+GOLD = "#B08D3C"       # primary gold
+GOLD_DK = "#8A6C28"    # deep bronze gold
+GOLD_LT = "#D8C48E"    # champagne
+SAND = "#C9A24B"       # warm secondary gold
+TEAL = "#2E6F63"       # gold-compatible green (improvement)
+CLAY = "#A6462F"       # terracotta (cost)
+BURG = "#7B3B47"       # burgundy accent
+SLATE = "#6B7280"      # neutral grey
+INK = "#23262B"        # near-black text
+SEQ = [GOLD, TEAL, GOLD_DK, SLATE, BURG, SAND, INK]
+DIVERGING = [CLAY, "#EAD9B0", "#D7E3D5", TEAL]     # neg = cost → pos = improvement
+GOLD_SEQ = ["#F4ECD8", GOLD_LT, GOLD, GOLD_DK]
+
+
+def _style(fig, height: int = 380, ytitle: str = "", xtitle: str = ""):
+    fig.update_layout(
+        template="plotly_white",
+        height=height,
+        margin=dict(l=10, r=10, t=40, b=10),
+        font=dict(family="Poppins, sans-serif", size=13, color=INK),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        colorway=SEQ,
+    )
+    if ytitle:
+        fig.update_yaxes(title_text=ytitle)
+    if xtitle:
+        fig.update_xaxes(title_text=xtitle)
+    return fig
+
+
+def hbar(df, cat, val, title, height=340, center_zero=True):
+    """Standardized diverging horizontal bar (terracotta = cost, teal = improvement/cheaper)."""
+    d = df.dropna(subset=[val]).copy()
+    fig = px.bar(d, x=val, y=cat, orientation="h", color=val,
+                 color_continuous_scale=DIVERGING if center_zero else GOLD_SEQ,
+                 color_continuous_midpoint=0 if center_zero else None)
+    fig.update_layout(coloraxis_showscale=False, yaxis={"categoryorder": "total ascending"})
+    return _style(fig, height=height, xtitle=title)
+
+
+def metric_row(items):
+    cols = st.columns(len(items))
+    for c, (label, value, help_) in zip(cols, items):
+        c.metric(label, value, help=help_)
+
+
+def framework_box(title, formula, assumptions, validity):
+    """Standardized per-tab methodology block."""
+    st.markdown(f"### {title}")
+    if formula:
+        st.latex(formula)
+    with st.expander("Methodology — assumptions & empirical validity", expanded=False):
+        st.markdown("**Assumptions & controls**")
+        st.markdown(assumptions)
+        st.markdown("**Is it a valid benchmark / formula?**")
+        st.markdown(validity)
+
+
+@st.cache_data(show_spinner="Running TCA pipeline…")
+def load():
+    child = CHILD_FILE if Path(CHILD_FILE).exists() else None
+    return run_parent_pipeline(DATA_FILE, child)
+
+
+def _fmt(x, d=2):
+    return "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x:,.{d}f}"
+
+
+# ---------------------------------------------------------------------------
+# load (hardcoded data, auto-runs)
+# ---------------------------------------------------------------------------
+try:
+    art = load()
+except Exception as exc:
+    st.error(f"Could not load {DATA_FILE}: {exc}")
+    st.stop()
+
+q, h = art.quality, art.headline
+clean = art.clean
+kept = clean.loc[clean["keep_for_analysis"]].copy()
+
+# sidebar — brand + global filters (descriptive tabs only; models use full data)
+st.sidebar.markdown("## Equity TCA")
+st.sidebar.caption("Best-execution analytics · multi-framework")
+st.sidebar.markdown("---")
+ccy_opts = sorted(kept["currency"].dropna().unique())
+sel_ccy = st.sidebar.multiselect("Currency", ccy_opts, default=[])
+fp_only = st.sidebar.toggle("Footprint orders only", value=True,
+                            help="Orders that actually traded away from arrival (|cost| > 0.5 bps).")
+st.sidebar.markdown("---")
+st.sidebar.markdown(
+    f"**Dataset:** `{DATA_FILE}`  \n"
+    f"**Orders:** {q.total_rows} · **kept** {q.kept_rows}  \n"
+    f"**Footprint:** {q.footprint_orders}  \n"
+    f"**Currencies:** {len(q.currency_counts)}  \n"
+    f"**Benchmark:** arrival (ArrPx)"
+)
+
+view = kept if not sel_ccy else kept[kept["currency"].isin(sel_ccy)]
+if fp_only:
+    view = view[view["has_footprint"]]
+
+st.title("Equity TCA — Best-Execution Dashboard")
+st.caption(
+    "One book of orders seen through seven cost frameworks. Negative bps = **cost**, "
+    "positive = **price improvement**. Primary benchmark: arrival price."
+)
+
+TABS = st.tabs([
+    "Overview",
+    "Arrival IS",
+    "VWAP & Attribution",
+    "Participation (POV)",
+    "Bloomberg TCA Model",
+    "Market Impact",
+    "Adjusted League",
+    "Efficient Frontier",
+    "Methodology",
+])
+
+# ===========================================================================
+# Overview
+# ===========================================================================
+with TABS[0]:
+    st.markdown("### Book at a glance")
+    metric_row([
+        ("Orders kept", f"{q.kept_rows}/{q.total_rows}", "After dropping missing arrival / neg spread"),
+        ("Footprint orders", f"{h.n_footprint}", "Traded away from arrival"),
+        ("VW cost vs arrival", f"{_fmt(h.value_weighted_slippage_bps)} bps", "Value-weighted Implementation Shortfall"),
+        ("VW cost vs VWAP", f"{_fmt(h.vwap_value_weighted_bps)} bps", "Drift-free execution cross-check"),
+    ])
+    st.markdown("#### Framework comparison — value-weighted cost of the book (bps)")
+    comp = pd.DataFrame({
+        "framework": ["Arrival IS", "Interval VWAP", "Bloomberg TCA(20%) est.", "Execution vs VWAP", "Timing drift"],
+        "bps": [
+            h.value_weighted_slippage_bps,
+            h.vwap_value_weighted_bps,
+            -float(np.average(kept["tca20"].dropna())) if kept["tca20"].notna().any() else np.nan,
+            attribution_summary(clean, footprint_only=True)["execution_vs_vwap_bps"],
+            attribution_summary(clean, footprint_only=True)["timing_drift_bps"],
+        ],
+    })
+    fig = px.bar(comp, x="framework", y="bps", color="bps",
+                 color_continuous_scale=[CLAY, "#fee2e2", "#dcfce7", TEAL], color_continuous_midpoint=0,
+                 text=comp["bps"].round(1))
+    fig.update_layout(coloraxis_showscale=False)
+    st.plotly_chart(_style(fig, ytitle="bps (neg = cost)"), use_container_width=True)
+    st.info(
+        "Each downstream tab is one framework in this comparison, with its formula, assumptions, "
+        "validity, and a **broker breakdown**. Bloomberg's TCA is shown as a cost (negated) for "
+        "comparability — it is an *ex-ante estimate*, the others are *realized*."
+    )
+    st.markdown("#### Currency mix")
+    cc = pd.Series(q.currency_counts).sort_values(ascending=False).reset_index()
+    cc.columns = ["currency", "orders"]
+    st.plotly_chart(_style(px.bar(cc, x="currency", y="orders", color_discrete_sequence=[GOLD]), height=300),
+                    use_container_width=True)
+
+# ===========================================================================
+# Arrival IS
+# ===========================================================================
+with TABS[1]:
+    framework_box(
+        "Implementation Shortfall vs Arrival (Perold, 1988)",
+        r"\text{slippage\_bps}_i=\mathrm{sf}_i\cdot\frac{\text{AvgPx}_i-\text{ArrPx}_i}{\text{ArrPx}_i}\times10^4",
+        "- **Benchmark = arrival (decision) price.** `sf` = −1 buy / +1 sell so both sides express cost as negative.\n"
+        "- Controls for comparison come later (regression tab); here it is the raw realized cost.\n"
+        "- Value-weighted by traded notional for the book number.",
+        "- **Valid, industry-standard benchmark.** Perold's Implementation Shortfall is the CFA-endorsed "
+        "best-execution measure. Sign verified against Bloomberg `AvgPx Vs ArrPx (Bps)` (corr −1.00 with cost).\n"
+        "- Caveat: it is *trading-related* IS only — no delay/opportunity terms (needs a separate decision price).",
+    )
+    metric_row([
+        ("VW cost", f"{_fmt(h.value_weighted_slippage_bps)} bps", None),
+        ("Median", f"{_fmt(h.median_slippage_bps)} bps", None),
+        ("Equal-wtd mean", f"{_fmt(h.mean_slippage_bps)} bps", None),
+        ("Footprint mean cost", f"{_fmt(h.footprint_mean_cost_bps)} bps", None),
+    ])
+    st.plotly_chart(_style(px.histogram(view, x="slippage_bps_w", nbins=50,
+                    color_discrete_sequence=[GOLD]), xtitle="slippage vs arrival (bps)"),
+                    use_container_width=True)
+    st.markdown("#### Broker breakdown — value-weighted arrival cost")
+    bd = (view.groupby("brkr_code").apply(
+            lambda g: pd.Series({
+                "cost_bps": np.average(g["slippage_bps"], weights=g["notional_local"].abs())
+                if g["notional_local"].abs().sum() > 0 else np.nan,
+                "n_orders": len(g)}), include_groups=False)
+          .reset_index())
+    st.plotly_chart(hbar(bd, "brkr_code", "cost_bps", "value-weighted slippage (bps)"), use_container_width=True)
+    st.dataframe(bd.round(2), use_container_width=True, hide_index=True)
+
+# ===========================================================================
+# VWAP & Attribution
+# ===========================================================================
+with TABS[2]:
+    framework_box(
+        "VWAP execution + skill-vs-drift attribution",
+        r"\text{slippage}_i=\underbrace{\mathrm{sf}_i\tfrac{\text{AvgPx}_i-\text{VWAP}_i}{\text{ArrPx}_i}10^4}_{\text{execution (controllable)}}+\underbrace{\mathrm{sf}_i\tfrac{\text{VWAP}_i-\text{ArrPx}_i}{\text{ArrPx}_i}10^4}_{\text{timing drift (context)}}",
+        "- Interval VWAP = the market's own average price over the order's fill window.\n"
+        "- Common **arrival denominator** makes the two terms add to arrival slippage exactly.\n"
+        "- Value-weighted; min-order filter drops thin buckets.",
+        "- **Valid & widely used.** VWAP is the most common execution benchmark; the arrival−VWAP split is the "
+        "standard decomposition of shortfall into *market impact/skill* vs *timing/drift*.\n"
+        "- Caveat: VWAP can be gamed by trading in line with volume; use alongside arrival, not instead of it.",
+    )
+    book = attribution_summary(clean, footprint_only=fp_only)
+    metric_row([
+        ("Execution vs VWAP", f"{_fmt(book['execution_vs_vwap_bps'])} bps", "Controllable skill"),
+        ("Timing drift", f"{_fmt(book['timing_drift_bps'])} bps", "Market moved while working"),
+        ("Total vs arrival", f"{_fmt(book['total_vs_arrival_bps'])} bps", "= execution + timing"),
+        ("Orders", f"{book['n']}", None),
+    ])
+    wf = go.Figure(go.Waterfall(orientation="v", measure=["relative", "relative", "total"],
+        x=["Execution vs VWAP", "Timing drift", "Total vs arrival"],
+        y=[book["execution_vs_vwap_bps"], book["timing_drift_bps"], book["total_vs_arrival_bps"]],
+        connector={"line": {"color": SLATE}}, decreasing={"marker": {"color": CLAY}},
+        increasing={"marker": {"color": TEAL}}, totals={"marker": {"color": GOLD}}))
+    st.plotly_chart(_style(wf, ytitle="bps (neg = cost)"), use_container_width=True)
+    st.markdown("#### Broker breakdown — execution vs timing (value-weighted)")
+    min_n = st.slider("Minimum orders per broker", 1, 50, 5, key="attr_minn")
+    tbl = attribution_by(clean, "brkr_code", footprint_only=fp_only, min_n=min_n)
+    if tbl.empty:
+        st.warning(f"No broker has ≥ {min_n} footprint orders.")
+    else:
+        bar = go.Figure()
+        bar.add_bar(x=tbl["brkr_code"], y=tbl["execution_vs_vwap_bps"], name="Execution vs VWAP", marker_color=GOLD)
+        bar.add_bar(x=tbl["brkr_code"], y=tbl["timing_drift_bps"], name="Timing drift", marker_color=SAND)
+        st.plotly_chart(_style(bar.update_layout(barmode="relative"), ytitle="bps (neg = cost)"),
+                        use_container_width=True)
+        st.caption("Ranked by execution-vs-VWAP — the drift-adjusted signal. Timing is context, not broker blame.")
+        st.dataframe(tbl.round(2), use_container_width=True, hide_index=True)
+
+# ===========================================================================
+# Participation (POV)
+# ===========================================================================
+with TABS[3]:
+    framework_box(
+        "Participation-rate (POV) cost curve",
+        r"\text{cost}\;\uparrow\;\text{with}\;\text{POV}=\text{Day Part Rate \%}=\frac{\text{FillQty}}{\text{market volume in window}}",
+        "- POV = realized participation (`Day Part Rate %`). Distinct from size/ADV — an order can be 0.2% ADV "
+        "but 60% of its interval's volume.\n"
+        "- Cost bucketed by POV band, value-weighted; footprint orders.",
+        "- **Valid and central to modern impact models** (Almgren 2005, Kissell I-Star): temporary impact rises "
+        "with participation. It is a *driver*, not a benchmark.\n"
+        "- Caveat: high-POV here often means thin-volume names, so buckets mix size and liquidity — read with n.",
+    )
+    pov = cost_by_participation(clean, footprint_only=fp_only)
+    if pov.empty:
+        st.warning("No participation data in selection.")
+    else:
+        fig = go.Figure()
+        fig.add_bar(x=pov["pov_bucket"], y=pov["cost_bps"], name="Realized cost", marker_color=GOLD)
+        fig.add_trace(go.Scatter(x=pov["pov_bucket"], y=pov["tca20_bps"], name="Bloomberg TCA(20%)",
+                                 mode="lines+markers", line=dict(color=SAND, width=3)))
+        st.plotly_chart(_style(fig, ytitle="bps"), use_container_width=True)
+        st.dataframe(pov.round(2), use_container_width=True, hide_index=True)
+    st.markdown("#### Cost vs participation — per order")
+    sc = px.scatter(view, x="day_part_rate", y="cost_bps_w", color="brkr_code",
+                    hover_data=["security", "qty_pct_adv_20d"], color_discrete_sequence=SEQ)
+    sc.update_xaxes(title="participation / Day Part Rate (%)")
+    st.plotly_chart(_style(sc, ytitle="cost vs arrival (bps)"), use_container_width=True)
+
+# ===========================================================================
+# Bloomberg TCA Model
+# ===========================================================================
+with TABS[4]:
+    m = art.tca_model
+    framework_box(
+        "Reverse-engineering Bloomberg's TCA(20%) pre-trade estimate",
+        r"\text{TCA20}_i \approx c_0 + c_1\,\text{spread\_bps}_i + c_2\sqrt{\%\text{ADV}_i} + c_3\,\sigma_i",
+        "- `TCA (20%)` = Bloomberg's ex-ante expected cost (bps) assuming a ~20% participation strategy.\n"
+        "- We regress it on its likely drivers: half-spread, square-root size impact, and 30-day volatility.\n"
+        "- **Drivers used raw** (not winsorized): TCA is a deterministic model output, its tails are signal.",
+        "- **This validates the square-root-impact law empirically**: a spread + √-size + vol form reproduces "
+        "Bloomberg's own model with high R². It is a *forecast*, not a realized cost.\n"
+        "- Use: (1) as a difficulty benchmark; (2) `realized − TCA` = vendor-adjusted performance (below).",
+    )
+    if m is None:
+        st.warning("TCA(20%) not available in this dataset.")
+    else:
+        metric_row([
+            ("Model R²", f"{m.r2:.3f}", "Variance of Bloomberg TCA explained"),
+            ("Orders", f"{m.n}", None),
+            ("Spread coef", f"{m.params.get('spread_bps', float('nan')):.3f}", "bps TCA per bps spread"),
+            ("√%ADV coef", f"{m.params.get('sqrt_adv', float('nan')):.2f}", "impact loading"),
+        ])
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Predicted vs actual TCA(20%)**")
+            f = m.frame
+            sc = px.scatter(f, x="tca20", y="tca20_pred", color_discrete_sequence=[GOLD], opacity=0.5)
+            lim = float(np.nanpercentile(f["tca20"], 99))
+            sc.add_trace(go.Scatter(x=[0, lim], y=[0, lim], mode="lines", line=dict(color=SLATE, dash="dash"), name="45°"))
+            st.plotly_chart(_style(sc, xtitle="actual TCA(20%) bps", ytitle="model prediction bps"), use_container_width=True)
+        with c2:
+            st.markdown("**What drives the estimate (avg bps)**")
+            dec = tca_component_decomposition(m)
+            st.plotly_chart(hbar(dec, "component", "bps", "avg contribution (bps)", center_zero=False),
+                            use_container_width=True)
+        st.markdown("#### Realized vs Bloomberg forecast — cost surprise by broker")
+        st.caption("cost surprise = realized cost − Bloomberg TCA(20%). Positive = executed worse than predicted.")
+        cs = cost_surprise_by(clean, "brkr_code", min_n=10)
+        st.plotly_chart(hbar(cs, "brkr_code", "cost_surprise_bps", "cost surprise (bps)"), use_container_width=True)
+        st.dataframe(cs.round(2), use_container_width=True, hide_index=True)
+
+# ===========================================================================
+# Market Impact
+# ===========================================================================
+with TABS[5]:
+    imp = art.impact
+    framework_box(
+        "Market-impact curve — square-root law",
+        r"\text{cost\_bps}_i \approx b_1\left(\frac{X_i}{\text{ADV}_i}\right)^{b_2}",
+        "- Fitted by non-linear least squares on the **footprint subset** (zero-footprint fills would flatten it).\n"
+        "- Measured vs arrival (the correct impact reference); unit-free bps (no currency mix).",
+        f"- **Empirically the dominant law** (Almgren–Thum–Hauptmann–Li 2005; Kissell): impact ∝ size^~0.5. "
+        f"Here b₂ = {imp.b2:.2f} — consistent with the square-root prior.\n"
+        "- Caveat: ~330 footprint orders across many names ⇒ indicative shape, wide error bars. Stress it.",
+    )
+    metric_row([
+        ("b₁ (scale)", f"{imp.b1:.2f}", f"se {imp.b1_se:.2f}"),
+        ("b₂ (exponent)", f"{imp.b2:.3f}", f"se {imp.b2_se:.3f}; 0.5 = square-root"),
+        ("Orders fit", f"{imp.n}", None),
+        ("", "", None),
+    ])
+    f = imp.frame.sort_values("x_over_adv")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=f["x_over_adv"], y=f["cost_bps"], mode="markers", name="orders",
+                             marker=dict(color=GOLD, opacity=0.35)))
+    fig.add_trace(go.Scatter(x=f["x_over_adv"], y=f["impact_fit_bps"], mode="lines", name="fitted √-law",
+                             line=dict(color=CLAY, width=3)))
+    st.plotly_chart(_style(fig, xtitle="X / ADV", ytitle="cost vs arrival (bps)"), use_container_width=True)
+
+# ===========================================================================
+# Adjusted League
+# ===========================================================================
+with TABS[6]:
+    framework_box(
+        "Difficulty-adjusted broker/venue league (fixed effects)",
+        r"\text{cost\_z}_i=\beta X_i+\gamma_{side}+\delta_{broker}+\varphi_{venue}+\varepsilon_i",
+        "- Controls `X`: %ADV, spread, log size, Volatil 30D, Day Part Rate %, entry time-of-day, side FE.\n"
+        "- Broker (δ) & venue (φ) fixed effects = quality after difficulty. SE **clustered by security**.\n"
+        "- Positive effect = costlier after controls.",
+        "- **The correct way to rank brokers** — raw averages are a confound (biggest broker gets hardest orders). "
+        "Fixed-effects + clustered SE is standard panel econometrics.\n"
+        "- Caveat: only ~3 brokers have enough orders to estimate precisely; show n.",
+    )
+    bt = art.broker_table
+    st.plotly_chart(hbar(bt.rename(columns={"bucket": "broker"}), "broker", "fe_effect",
+                         "broker fixed effect (costlier →)"), use_container_width=True)
+    st.dataframe(bt.round(3), use_container_width=True, hide_index=True)
+    st.markdown("#### Venue")
+    vt = art.venue_table
+    st.plotly_chart(hbar(vt.rename(columns={"bucket": "venue"}), "venue", "fe_effect",
+                         "venue fixed effect (costlier →)", height=420), use_container_width=True)
+    with st.expander("Regression snapshot (clustered SE by security)"):
+        st.code(art.regression.ols_result.summary().as_text()[:4000])
+
+# ===========================================================================
+# Efficient Frontier
+# ===========================================================================
+with TABS[7]:
+    framework_box(
+        "Kissell–Glantz–Malamut Efficient Trading Frontier",
+        r"\min\ \text{Cost}(H)\quad\text{s.t.}\quad \text{Risk}(H)\le R^\*,\qquad H=\text{trading horizon}",
+        "- One frontier **per order**: vary the horizon (fast = high cost/low risk → slow = low cost/high risk).\n"
+        "- Cost from the calibrated impact model; risk from Volatil 30D. α = 0.95 temp/perm split fixed; E[drift]=0.\n"
+        "- Single security (scalar risk); price level = arrival.",
+        "- **Theoretically grounded** (Almgren–Chriss 2000; Kissell 2004). Best-execution = sitting *on* the frontier, "
+        "regardless of realized luck.\n"
+        "- Caveat: ex-ante & illustrative — realized placement needs intraday child-fill timestamps (not yet available).",
+    )
+    pool = kept.loc[kept["has_volatility"] & kept["adv_shares_20d"].gt(0) & kept["volatil_30d"].gt(0)]
+    if pool.empty:
+        st.warning("No volatility-covered orders to build a frontier.")
+    else:
+        pool = pool.reset_index(drop=True)
+        labels = (pool["security"] + "  (" + pool["order_id"] + ")").tolist()
+        default_idx = int(pool["qty_pct_adv_20d"].fillna(0).values.argmax())
+        choice = st.selectbox("Order", labels, index=default_idx)
+        row = pool.iloc[labels.index(choice)]
+        spec = order_spec_from_row(row, art.impact.b1, art.impact.b2)
+        etf = build_etf(spec)
+        col1, col2 = st.columns(2)
+        r_star = col1.slider("Risk cap R* (bps)", float(etf["risk_bps"].min()), float(etf["risk_bps"].max()),
+                             float(etf["risk_bps"].median()))
+        lam = col2.slider("Risk aversion λ", 0.0, 0.5, 0.05, 0.01)
+        pts = decision_points(etf, r_star=r_star, lam=lam)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=etf["risk_bps"], y=etf["cost_bps"], mode="lines+markers",
+                                 name="frontier", line=dict(color=GOLD)))
+        for key, color, nm in [("goal1_min_cost_risk_cap", CLAY, "min cost | risk≤R*"),
+                               ("goal2_min_cost_plus_lambda_risk", TEAL, "min Cost+λ·Risk"),
+                               ("goal3_price_improvement", "#7c3aed", "price improvement")]:
+            if key in pts:
+                p = pts[key]
+                fig.add_trace(go.Scatter(x=[p["risk_bps"]], y=[p["cost_bps"]], mode="markers",
+                                         marker=dict(size=15, color=color), name=nm))
+        st.plotly_chart(_style(fig, xtitle="risk (bps)", ytitle="expected cost (bps)"), use_container_width=True)
+        st.caption(f"{spec.label} · X/ADV = {spec.x_shares/spec.adv_shares:.2%} · σ = {spec.sigma_annual:.1%} · "
+                   f"arrival {spec.open_px:.2f} {spec.currency}")
+
+# ===========================================================================
+# Methodology
+# ===========================================================================
+with TABS[8]:
+    st.markdown("### How everything is calculated")
+    st.markdown(
+        "Full reference: **METHODOLOGY.md** in the project root. Sign convention throughout: "
+        "**negative bps = cost, positive = price improvement.**"
+    )
+    st.markdown(f"""
+| Framework (tab) | Formula | Uses | Validity |
+|---|---|---|---|
+| Arrival IS | `sf·(AvgPx−ArrPx)/ArrPx·1e4` | arrival price | Perold IS — CFA best-ex standard |
+| VWAP + attribution | `slip = exec_vs_vwap + timing` | interval VWAP | standard shortfall decomposition |
+| Participation | cost vs `Day Part Rate %` | POV | driver in Almgren/Kissell impact |
+| Bloomberg TCA | `TCA20 ≈ c₀+c₁·spread+c₂·√%ADV+c₃·σ` (R²={art.tca_model.r2:.2f}) | spread, size, vol | reproduces vendor √-law model |
+| Market impact | `cost ≈ b₁·(X/ADV)^b₂` (b₂={art.impact.b2:.2f}) | size/ADV | Almgren 2005 square-root law |
+| Adjusted league | `cost_z ~ βX + δ_broker + φ_venue` | controls + FE | panel FE, clustered SE |
+| Efficient frontier | `min Cost s.t. Risk≤R*` | impact + vol | Almgren–Chriss / Kissell 2004 |
+""")
+    st.markdown("#### Key empirical insights from this book")
+    st.markdown(
+        f"- **Value-weighted execution is essentially flat vs arrival ({_fmt(h.value_weighted_slippage_bps)} bps)** — "
+        "the book trades close to its decision price; cost lives in a minority of footprint orders.\n"
+        f"- **Bloomberg's TCA(20%) is a spread + √-size + vol model (R² = {art.tca_model.r2:.2f})**, "
+        "independent of participation → confirms it is a fixed-20%-POV pre-trade estimate.\n"
+        f"- **Impact exponent b₂ ≈ {art.impact.b2:.2f}** — consistent with the empirical square-root law.\n"
+        "- Broker apparent-outperformance is often **timing drift, not skill** — the VWAP attribution separates them.\n"
+        "- **Open Px / Low / High remain an export snapshot** (AvgPx in-range only "
+        f"{100*(q.total_rows-q.flagged_avgpx_outside_hilo)/q.total_rows:.0f}%) → the open benchmark is retired."
+    )
