@@ -20,6 +20,10 @@ from tca.pipeline import run_parent_pipeline
 from tca.insights import attribution_by, attribution_summary, cost_by_participation, child_routes_for_broker
 from tca.tca_model import tca_component_decomposition, cost_surprise_by
 from tca.kissell import build_etf, decision_points, order_spec_from_row
+from tca.segments import (
+    cost_stats, MKTCAP_DEFS, ADV_DEFS, SPREAD_DEFS,
+    MKTCAP_ORDER, ADV_ORDER, SPREAD_ORDER,
+)
 
 # ---------------------------------------------------------------------------
 # config + shared styling (standardized visuals)
@@ -190,12 +194,15 @@ if fp_only:
 
 st.title("Equity TCA — Best-Execution Dashboard")
 st.caption(
-    "One book of orders seen through seven cost frameworks. Negative bps = **cost**, "
+    "One book of orders seen through multiple cost frameworks, plus EDA and a segmented "
+    "Market-Order TCA view. Unless a tab states otherwise, negative bps = **cost**, "
     "positive = **price improvement**. Primary benchmark: arrival price."
 )
 
 TABS = st.tabs([
     "Overview",
+    "EDA",
+    "Market-Order TCA",
     "Arrival IS",
     "VWAP & Attribution",
     "Participation (POV)",
@@ -205,11 +212,13 @@ TABS = st.tabs([
     "Efficient Frontier",
     "Methodology",
 ])
+# tab index map (kept explicit so inserts don't silently misalign the `with` blocks)
+T_OVERVIEW, T_EDA, T_MOTCA, T_ARRIVAL, T_VWAP, T_POV, T_BBG, T_IMPACT, T_LEAGUE, T_ETF, T_METHOD = range(11)
 
 # ===========================================================================
 # Overview
 # ===========================================================================
-with TABS[0]:
+with TABS[T_OVERVIEW]:
     st.markdown("### Book at a glance")
     metric_row([
         ("Orders kept", f"{q.kept_rows}/{q.total_rows}", "After dropping missing arrival / neg spread"),
@@ -245,9 +254,191 @@ with TABS[0]:
                     use_container_width=True)
 
 # ===========================================================================
+# EDA — exploratory data analysis
+# ===========================================================================
+with TABS[T_EDA]:
+    st.markdown("### Exploratory data analysis")
+    st.caption("Distributions, category mix, missingness and driver correlations before any modelling. "
+               "Honours the sidebar currency filter.")
+    eda = kept if not sel_ccy else kept[kept["currency"].isin(sel_ccy)]
+
+    st.markdown("#### Numeric distributions")
+    num_specs = [
+        ("cost_bps_w", "Arrival cost (bps, +=cost)"),
+        ("spread_bps", "Bid-ask spread (bps)"),
+        ("qty_pct_adv_20d", "Order size (% ADV)"),
+        ("day_part_rate", "Participation / POV (%)"),
+        ("volatil_30d", "30-day volatility (%)"),
+        ("market_cap_usd_bn", "Market cap (USD bn)"),
+    ]
+    cols = st.columns(3)
+    for i, (col, lab) in enumerate(num_specs):
+        d = eda[col].replace([np.inf, -np.inf], np.nan).dropna()
+        if col in ("qty_pct_adv_20d", "market_cap_usd_bn", "spread_bps"):
+            d = d[d > 0]
+            fig = px.histogram(np.log10(d), nbins=40, color_discrete_sequence=[GOLD])
+            fig.update_xaxes(title=f"log10 {lab}")
+        else:
+            fig = px.histogram(d, nbins=40, color_discrete_sequence=[GOLD])
+            fig.update_xaxes(title=lab)
+        cols[i % 3].plotly_chart(_style(fig, height=260), use_container_width=True)
+
+    st.markdown("#### Category mix")
+    cat_specs = [("region", "Region"), ("mktcap_group", "Market-cap group"),
+                 ("adv_group", "ADV% group"), ("spread_bucket", "Spread bucket"),
+                 ("direction", "Direction"), ("brkr_code", "Broker")]
+    ccols = st.columns(3)
+    for i, (col, lab) in enumerate(cat_specs):
+        vc = eda[col].value_counts(dropna=False).reset_index()
+        vc.columns = [lab, "orders"]
+        fig = px.bar(vc, x=lab, y="orders", color_discrete_sequence=[GOLD_DK])
+        ccols[i % 3].plotly_chart(_style(fig, height=260), use_container_width=True)
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        st.markdown("#### Field coverage")
+        cov_fields = ["arr_px", "interval_vwap", "open_px", "tca20", "day_part_rate",
+                      "volatil_30d", "spread_bps", "market_cap_usd_bn", "industry", "rsi_14d"]
+        cov = pd.DataFrame({
+            "field": cov_fields,
+            "coverage_%": [round(100 * eda[f].notna().mean(), 1) for f in cov_fields],
+        }).sort_values("coverage_%")
+        st.dataframe(cov, use_container_width=True, hide_index=True)
+    with c2:
+        st.markdown("#### Driver correlations")
+        corr_cols = ["cost_bps_w", "spread_bps", "qty_pct_adv_20d", "day_part_rate",
+                     "volatil_30d", "tca20"]
+        cm = eda[corr_cols].replace([np.inf, -np.inf], np.nan).corr()
+        fig = px.imshow(cm, text_auto=".2f", color_continuous_scale=[CLAY, "#f4f1e9", TEAL],
+                        zmin=-1, zmax=1, aspect="auto")
+        st.plotly_chart(_style(fig, height=300), use_container_width=True)
+
+# ===========================================================================
+# Market-Order TCA framework (segmented)
+# ===========================================================================
+with TABS[T_MOTCA]:
+    st.markdown("### Market-Order TCA Framework")
+    st.markdown(
+        "**Core question:** where do we see higher or lower arrival-to-execution slippage for "
+        "**market orders** in **2026 H1**? Segmentation matters — the same broker looks good on "
+        "large-cap US names and poor on small-cap Asian ones."
+    )
+    st.latex(r"\text{Cost bps} = \text{SideSign}\times\frac{\text{ExecAvgPx}-\text{ArrPx}}{\text{ArrPx}}\times10^4,"
+             r"\quad \text{Buy}=+1,\ \text{Sell}=-1\ \Rightarrow\ \textbf{positive = cost}")
+
+    with st.expander("Data fields, grouping methodology & bucket definitions", expanded=False):
+        st.markdown(
+            "**Data fields** — *Order:* trade date, arrival time, arrival price, direction, broker · "
+            "*Market:* arrival price, average price, market cap, region, industry · "
+            "*Cost:* Mean / Median / Std-Dev cost (bps), cost t-stat · "
+            "*Further:* AVAT, historical volatility, interval VWAP.\n\n"
+            "**Grouping methodology**\n"
+            "- **Broker quality** — algo/execution quality by context: Region → Industry → Broker → Direction\n"
+            "- **Size effect** — cost of small-cap trading: Market-Cap Group → Direction\n"
+            "- **Market impact** — cost of high participation: ADV% Group → Direction\n"
+            "- **Liquidity cost** — cost of crossing wide spreads: Spread Bucket → Direction\n\n"
+            "*Buckets are initial proposals; feature sets and ML-based feature selection can be explored "
+            "once per-cell sample sizes are sufficient.*"
+        )
+        b1, b2, b3 = st.columns(3)
+        b1.markdown("**Market cap**\n\n" + "\n".join(f"- {k}: {v}" for k, v in MKTCAP_DEFS.items()))
+        b2.markdown("**ADV%**\n\n" + "\n".join(f"- {k}: {v}" for k, v in ADV_DEFS.items()))
+        b3.markdown("**Spread**\n\n" + "\n".join(f"- {k}: {v}" for k, v in SPREAD_DEFS.items()))
+
+    # ---- order segregation: Market vs Limit (LmtPx = "MKT" flags market orders) --------
+    st.markdown("#### Order segregation")
+    seg = (kept.groupby("order_type")
+           .apply(lambda g: pd.Series({
+               "n_orders": len(g),
+               "mean_cost_bps": np.average(g["cost_bps"], weights=g["notional_local"].abs())
+               if g["notional_local"].abs().sum() > 0 else np.nan,
+               "median_cost_bps": g["cost_bps"].median(),
+               "footprint": int(g["has_footprint"].sum())}), include_groups=False)
+           .reset_index())
+    sc1, sc2 = st.columns([1, 1])
+    with sc1:
+        fig = px.bar(seg, x="order_type", y="n_orders", color="order_type",
+                     color_discrete_sequence=[GOLD, SLATE, BURG], text="n_orders")
+        st.plotly_chart(_style(fig, height=280, ytitle="orders"), use_container_width=True)
+    with sc2:
+        st.dataframe(seg.round(2), use_container_width=True, hide_index=True)
+    st.caption("Market orders (`LmtPx = MKT`) are the framework's population. Limit orders are segregated "
+               "out — their opportunity cost is a separate study (see Future Analysis).")
+
+    otype = st.radio("Population", ["Market orders", "Limit orders", "All orders"], horizontal=True)
+    type_map = {"Market orders": "Market", "Limit orders": "Limit", "All orders": None}
+    fp_seg = st.toggle("Footprint orders only", value=False, key="motca_fp",
+                       help="~2/3 fill at arrival (median cost 0); footprint isolates orders that moved.")
+    src = clean.copy()
+    if type_map[otype] is not None:
+        src = src[src["order_type"] == type_map[otype]]
+    if fp_seg:
+        src = src[src["has_footprint"] | ~src["keep_for_analysis"]]
+
+    # ---- book segregation treemap across factors (market orders sized by n, coloured by cost) ---
+    tre = src.loc[src["keep_for_analysis"]].dropna(subset=["region", "mktcap_group", "direction"]).copy()
+    if not tre.empty:
+        tre["mktcap_group"] = tre["mktcap_group"].astype(str)
+        agg = (tre.groupby(["region", "mktcap_group", "direction"], observed=True)
+               .agg(n=("cost_bps", "size"), cost=("cost_bps", "mean")).reset_index())
+        agg = agg[agg["n"] >= 3]
+        if not agg.empty:
+            fig = px.treemap(agg, path=[px.Constant("Book"), "region", "mktcap_group", "direction"],
+                             values="n", color="cost", color_continuous_scale=[TEAL, "#f4f1e9", CLAY],
+                             color_continuous_midpoint=0)
+            st.plotly_chart(_style(fig, height=420).update_layout(margin=dict(t=30, l=10, r=10, b=10)),
+                            use_container_width=True)
+            st.caption("Book segregated Region → Market-cap → Direction. Box size = order count, "
+                       "colour = mean cost (red = costlier, teal = cheaper).")
+
+    # ---- grouping methodology ---------------------------------------------------------
+    st.markdown("#### Segmented cost analysis")
+    method = st.radio("Grouping methodology", ["Broker quality", "Size effect", "Market impact", "Liquidity cost"],
+                      horizontal=True)
+    cfg = {
+        "Broker quality": (["region", "brkr_code", "direction"], "brkr_code", "direction", None),
+        "Size effect": (["mktcap_group", "direction"], "mktcap_group", "direction", MKTCAP_ORDER),
+        "Market impact": (["adv_group", "direction"], "adv_group", "direction", ADV_ORDER),
+        "Liquidity cost": (["spread_bucket", "direction"], "spread_bucket", "direction", SPREAD_ORDER),
+    }
+    by, primary, color, order = cfg[method]
+    min_n = st.slider("Minimum orders per cell", 3, 40, 5, key="motca_minn")
+    stats = cost_stats(src, by, min_n=min_n)
+    if stats.empty:
+        st.warning(f"No cell has ≥ {min_n} orders for this grouping/population.")
+    else:
+        cat_orders = {primary: order} if order else {}
+        fig = px.bar(stats, x=primary, y="mean_cost_bps", color=color, barmode="group",
+                     color_discrete_sequence=[GOLD, TEAL, SLATE, BURG],
+                     category_orders=cat_orders, hover_data=["n_orders", "t_stat", "median_cost_bps"])
+        st.plotly_chart(_style(fig, ytitle="mean cost (bps, +=cost)"), use_container_width=True)
+        st.caption("|t-stat| ≳ 2 ⇒ the group's mean cost is statistically different from zero.")
+        show = stats.copy()
+        for c in ["mean_cost_bps", "median_cost_bps", "std_cost_bps", "t_stat", "vw_cost_bps"]:
+            show[c] = show[c].round(2)
+        st.dataframe(show, use_container_width=True, hide_index=True)
+        sig = stats.loc[stats["t_stat"].abs() >= 2].sort_values("mean_cost_bps", ascending=False)
+        if not sig.empty:
+            top = sig.iloc[0]
+            grp = " / ".join(str(top[c]) for c in by)
+            st.success(f"**Most significant cost cell:** {grp} — mean {top['mean_cost_bps']:.1f} bps "
+                       f"(t = {top['t_stat']:.1f}, n = {int(top['n_orders'])}).")
+
+    with st.expander("Future analysis (roadmap)"):
+        st.markdown(
+            "1. **Opportunity cost** — study price movement *after* order completion; compare average price "
+            "to day VWAP and close price.\n"
+            "2. **Limit orders** — opportunity cost of a potentially better average price when the market never "
+            "reaches the initial limit (segregated above; 131 limit orders here).\n"
+            "3. **Operational cost** — cost of live orders between the actual placed time and the arrival time.\n"
+            "4. **More data** — actual market volumes and price within the trading lifespan, to split slippage "
+            "into **momentum cost, speed cost, liquidity premium**."
+        )
+
+# ===========================================================================
 # Arrival IS
 # ===========================================================================
-with TABS[1]:
+with TABS[T_ARRIVAL]:
     framework_box(
         "Implementation Shortfall vs Arrival (Perold, 1988)",
         r"\text{slippage\_bps}_i=\mathrm{sf}_i\cdot\frac{\text{AvgPx}_i-\text{ArrPx}_i}{\text{ArrPx}_i}\times10^4",
@@ -280,7 +471,7 @@ with TABS[1]:
 # ===========================================================================
 # VWAP & Attribution
 # ===========================================================================
-with TABS[2]:
+with TABS[T_VWAP]:
     framework_box(
         "VWAP execution + skill-vs-drift attribution",
         r"\text{slippage}_i=\underbrace{\mathrm{sf}_i\tfrac{\text{AvgPx}_i-\text{VWAP}_i}{\text{ArrPx}_i}10^4}_{\text{execution (controllable)}}+\underbrace{\mathrm{sf}_i\tfrac{\text{VWAP}_i-\text{ArrPx}_i}{\text{ArrPx}_i}10^4}_{\text{timing drift (context)}}",
@@ -321,7 +512,7 @@ with TABS[2]:
 # ===========================================================================
 # Participation (POV)
 # ===========================================================================
-with TABS[3]:
+with TABS[T_POV]:
     framework_box(
         "Participation-rate (POV) cost curve",
         r"\text{cost}\;\uparrow\;\text{with}\;\text{POV}=\text{Day Part Rate \%}=\frac{\text{FillQty}}{\text{market volume in window}}",
@@ -351,7 +542,7 @@ with TABS[3]:
 # ===========================================================================
 # Bloomberg TCA Model
 # ===========================================================================
-with TABS[4]:
+with TABS[T_BBG]:
     m = art.tca_model
     framework_box(
         "Reverse-engineering Bloomberg's TCA(20%) pre-trade estimate",
@@ -394,7 +585,7 @@ with TABS[4]:
 # ===========================================================================
 # Market Impact
 # ===========================================================================
-with TABS[5]:
+with TABS[T_IMPACT]:
     imp = art.impact
     framework_box(
         "Market-impact curve — square-root law",
@@ -422,7 +613,7 @@ with TABS[5]:
 # ===========================================================================
 # Adjusted League
 # ===========================================================================
-with TABS[6]:
+with TABS[T_LEAGUE]:
     framework_box(
         "Difficulty-adjusted broker/venue league (fixed effects)",
         r"\text{cost\_z}_i=\beta X_i+\gamma_{side}+\delta_{broker}+\varphi_{venue}+\varepsilon_i",
@@ -447,7 +638,7 @@ with TABS[6]:
 # ===========================================================================
 # Efficient Frontier
 # ===========================================================================
-with TABS[7]:
+with TABS[T_ETF]:
     framework_box(
         "Kissell–Glantz–Malamut Efficient Trading Frontier",
         r"\min\ \text{Cost}(H)\quad\text{s.t.}\quad \text{Risk}(H)\le R^\*,\qquad H=\text{trading horizon}",
@@ -491,7 +682,7 @@ with TABS[7]:
 # ===========================================================================
 # Methodology
 # ===========================================================================
-with TABS[8]:
+with TABS[T_METHOD]:
     st.markdown("### How everything is calculated")
     st.markdown(
         "Full reference: **METHODOLOGY.md** in the project root. Sign convention throughout: "
@@ -500,6 +691,7 @@ with TABS[8]:
     st.markdown(f"""
 | Framework (tab) | Formula | Uses | Validity |
 |---|---|---|---|
+| Market-Order TCA | `Cost = SideSign·(AvgPx−ArrPx)/ArrPx·1e4` grouped | region/cap/ADV%/spread | segmented mean/median/std/t-stat |
 | Arrival IS | `sf·(AvgPx−ArrPx)/ArrPx·1e4` | arrival price | Perold IS — CFA best-ex standard |
 | VWAP + attribution | `slip = exec_vs_vwap + timing` | interval VWAP | standard shortfall decomposition |
 | Participation | cost vs `Day Part Rate %` | POV | driver in Almgren/Kissell impact |

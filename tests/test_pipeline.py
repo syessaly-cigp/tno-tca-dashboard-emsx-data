@@ -137,6 +137,34 @@ def test_permanent_impact_fraction():
     assert cost_long == pytest.approx((1 - ALPHA) * full_bps, rel=0.05)
 
 
+def test_segments_and_cost_stats():
+    from tca.segments import add_segments, cost_stats
+    base = _toy_parent()
+    base["MC Lst Trd"] = [15000.0, 5000.0, 1000.0]      # USD m -> 15bn, 5bn, 1bn
+    base["Primary Exchange MIC (FIGI or Tkr+YKey)"] = ["XNYS", "XLON", "XHKG"]
+    base["Bid Ask Sprd"] = [0.02, 0.20, 0.60]           # -> tight / medium+ / wider in bps
+    clean = clean_parent_orders(base)
+    # market-cap buckets from MC Lst Trd (USD m / 1000 = bn)
+    caps = dict(zip(clean["order_id"], clean["mktcap_group"].astype(str)))
+    assert caps["1"] == "Large Cap" and caps["2"] == "Mid Cap" and caps["3"] == "Small Cap"
+    # region mapped from MIC
+    assert clean.loc[clean.order_id == "1", "region"].iloc[0] == "Americas"
+    assert clean.loc[clean.order_id == "2", "region"].iloc[0] == "Europe"
+    # direction present, cost_stats returns the stat columns incl t-stat
+    cs = cost_stats(clean, ["direction"], min_n=1)
+    assert {"mean_cost_bps", "median_cost_bps", "std_cost_bps", "t_stat", "n_orders"}.issubset(cs.columns)
+
+
+def test_order_type_segregation():
+    base = _toy_parent()
+    base["LmtPx"] = ["MKT", "101.5", "MKT"]     # market, limit, market
+    clean = clean_parent_orders(base)
+    types = dict(zip(clean["order_id"], clean["order_type"]))
+    assert types["1"] == "Market" and types["3"] == "Market"
+    assert types["2"] == "Limit"
+    assert clean.loc[clean.order_id == "2", "lmt_px"].iloc[0] == pytest.approx(101.5)
+
+
 def test_tca_model_reproduces_bloomberg():
     # synthetic: TCA20 built exactly as spread + sqrt(adv) + vol, model must recover R²≈1
     import numpy as np

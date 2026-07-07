@@ -28,6 +28,16 @@ from .tca_model import (
     tca_component_decomposition,
     cost_surprise_by,
 )
+from .segments import (
+    add_segments,
+    cost_stats,
+    MKTCAP_DEFS,
+    ADV_DEFS,
+    SPREAD_DEFS,
+    MKTCAP_ORDER,
+    ADV_ORDER,
+    SPREAD_ORDER,
+)
 from .kissell import (
     calibrate_faithful_impact,
     build_etf,

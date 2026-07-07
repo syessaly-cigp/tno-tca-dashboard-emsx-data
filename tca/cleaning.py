@@ -6,6 +6,8 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
+from .segments import add_segments
+
 
 @dataclass(frozen=True)
 class QualityReport:
@@ -141,6 +143,14 @@ def clean_parent_orders(
     df["tif"] = _coalesce(df, ["TIF"]).astype(str).str.strip()
     df["handling_inst"] = _coalesce(df, ["Handling Inst"]).astype(str).str.strip()
 
+    # Order-type segregation: EMSX writes LmtPx = "MKT" for market orders, else a limit price.
+    _lmt = _coalesce(df, ["LmtPx"]).astype(str).str.strip()
+    df["lmt_px"] = pd.to_numeric(_lmt.str.replace(",", "", regex=False), errors="coerce")
+    df["order_type"] = np.where(
+        _lmt.str.upper().eq("MKT"), "Market",
+        np.where(df["lmt_px"].notna(), "Limit", "Unknown"),
+    )
+
     # numerics — prices & benchmarks
     df["qty"] = _num(_coalesce(df, ["Qty"]))
     df["fill_qty"] = _num(_coalesce(df, ["FillQty"]))
@@ -162,6 +172,9 @@ def clean_parent_orders(
     df["fillqty_pct_vwap_vol"] = _num(_coalesce(df, ["FillQty % VWAP Vol"]))
     df["tca20"] = _num(_coalesce(df, ["TCA (20%)"]))                         # Bloomberg pre-trade cost estimate (bps, 20% POV)
     df["rsi_14d"] = _num(_coalesce(df, ["RSI 14D"]))                         # short-term momentum signal
+    df["mc_last_trade"] = _num(_coalesce(df, ["MC Lst Trd"]))                # market cap, millions of local ccy
+    df["primary_mic"] = _coalesce(df, ["Primary Exchange MIC (FIGI or Tkr+YKey)"]).astype(str).str.strip()
+    df["avat_proxy"] = _num(_coalesce(df, ["Avg Vol 30D"]))                  # AVAT proxy (avg daily volume)
     df["qty_pct_adv_20d"] = _num(
         _coalesce(df, ["FillQty % Avg Vol 20D", "Qty % Avg Vol 20D"])
     )
@@ -254,6 +267,9 @@ def clean_parent_orders(
         & df["arr_px"].gt(0)
         & df["slippage_bps"].notna()
     )
+
+    # Market-Order TCA segmentation factors (region / industry / cap / ADV% / spread / direction)
+    df = add_segments(df)
     return df.reset_index(drop=True)
 
 
