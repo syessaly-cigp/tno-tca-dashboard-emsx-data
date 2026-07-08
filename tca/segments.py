@@ -118,9 +118,12 @@ def add_segments(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # Benchmark → cost column (positive = cost). Mirrors Bloomberg BTCA's multi-benchmark view.
+# "Bloomberg TCA(20%)" is the vendor's *ex-ante estimate* (not a realized benchmark) — shown
+# alongside the realized costs so each group's actual cost can be read against the prediction.
 BENCHMARK_COLS = {
     "Arrival": "cost_bps",
     "Interval VWAP": "cost_vwap_bps",
+    "Bloomberg TCA(20%) est.": "tca20",
     "Open (diagnostic)": "cost_open_bps",
 }
 # fields offered as pivot categories (label → column)
