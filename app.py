@@ -21,7 +21,8 @@ from tca.insights import attribution_by, attribution_summary, cost_by_participat
 from tca.tca_model import tca_component_decomposition, cost_surprise_by
 from tca.kissell import build_etf, decision_points, order_spec_from_row
 from tca.segments import (
-    cost_stats, MKTCAP_DEFS, ADV_DEFS, SPREAD_DEFS,
+    cost_stats, btca_pivot, BENCHMARK_COLS, PIVOT_CATEGORIES,
+    MKTCAP_DEFS, ADV_DEFS, SPREAD_DEFS,
     MKTCAP_ORDER, ADV_ORDER, SPREAD_ORDER,
 )
 
@@ -149,9 +150,9 @@ def framework_box(title, formula, assumptions, validity):
 
 
 @st.cache_data(show_spinner="Running TCA pipeline…")
-def load():
+def load(exclude_gtc: bool):
     child = CHILD_FILE if Path(CHILD_FILE).exists() else None
-    return run_parent_pipeline(DATA_FILE, child)
+    return run_parent_pipeline(DATA_FILE, child, exclude_gtc=exclude_gtc)
 
 
 def _fmt(x, d=2):
@@ -159,10 +160,19 @@ def _fmt(x, d=2):
 
 
 # ---------------------------------------------------------------------------
-# load (hardcoded data, auto-runs)
+# sidebar (rendered first so the GTC filter re-runs the pipeline before load)
 # ---------------------------------------------------------------------------
+st.sidebar.markdown("## Equity TCA")
+st.sidebar.caption("Best-execution analytics · multi-framework")
+st.sidebar.markdown("---")
+exclude_gtc = st.sidebar.toggle(
+    "Exclude GTC orders", value=True,
+    help="Good-Till-Cancelled orders span multiple sessions (stale arrival); excluded by default. "
+         "The whole analysis re-runs on the remainder.",
+)
+
 try:
-    art = load()
+    art = load(exclude_gtc)
 except Exception as exc:
     st.error(f"Could not load {DATA_FILE}: {exc}")
     st.stop()
@@ -171,10 +181,6 @@ q, h = art.quality, art.headline
 clean = art.clean
 kept = clean.loc[clean["keep_for_analysis"]].copy()
 
-# sidebar — brand + global filters (descriptive tabs only; models use full data)
-st.sidebar.markdown("## Equity TCA")
-st.sidebar.caption("Best-execution analytics · multi-framework")
-st.sidebar.markdown("---")
 ccy_opts = sorted(kept["currency"].dropna().unique())
 sel_ccy = st.sidebar.multiselect("Currency", ccy_opts, default=[])
 fp_only = st.sidebar.toggle("Footprint orders only", value=True,
@@ -182,7 +188,8 @@ fp_only = st.sidebar.toggle("Footprint orders only", value=True,
 st.sidebar.markdown("---")
 st.sidebar.markdown(
     f"**Dataset:** `{DATA_FILE}`  \n"
-    f"**Orders:** {q.total_rows} · **kept** {q.kept_rows}  \n"
+    f"**GTC excluded:** {'yes' if exclude_gtc else 'no'}  \n"
+    f"**Orders in scope:** {q.total_rows} · **kept** {q.kept_rows}  \n"
     f"**Footprint:** {q.footprint_orders}  \n"
     f"**Currencies:** {len(q.currency_counts)}  \n"
     f"**Benchmark:** arrival (ArrPx)"
@@ -203,6 +210,7 @@ TABS = st.tabs([
     "Overview",
     "EDA",
     "Market-Order TCA",
+    "BTCA Pivot",
     "Arrival IS",
     "VWAP & Attribution",
     "Participation (POV)",
@@ -213,7 +221,8 @@ TABS = st.tabs([
     "Methodology",
 ])
 # tab index map (kept explicit so inserts don't silently misalign the `with` blocks)
-T_OVERVIEW, T_EDA, T_MOTCA, T_ARRIVAL, T_VWAP, T_POV, T_BBG, T_IMPACT, T_LEAGUE, T_ETF, T_METHOD = range(11)
+(T_OVERVIEW, T_EDA, T_MOTCA, T_BTCA, T_ARRIVAL, T_VWAP, T_POV,
+ T_BBG, T_IMPACT, T_LEAGUE, T_ETF, T_METHOD) = range(12)
 
 # ===========================================================================
 # Overview
@@ -350,8 +359,8 @@ with TABS[T_MOTCA]:
     seg = (kept.groupby("order_type")
            .apply(lambda g: pd.Series({
                "n_orders": len(g),
-               "mean_cost_bps": np.average(g["cost_bps"], weights=g["notional_local"].abs())
-               if g["notional_local"].abs().sum() > 0 else np.nan,
+               "mean_cost_bps": np.average(g["cost_bps"], weights=g["notional_usd"])
+               if g["notional_usd"].sum() > 0 else np.nan,
                "median_cost_bps": g["cost_bps"].median(),
                "footprint": int(g["has_footprint"].sum())}), include_groups=False)
            .reset_index())
@@ -436,6 +445,70 @@ with TABS[T_MOTCA]:
         )
 
 # ===========================================================================
+# BTCA Pivot — Bloomberg-style multi-benchmark cost pivot
+# ===========================================================================
+with TABS[T_BTCA]:
+    st.markdown("### BTCA Pivot — cost by category vs benchmarks")
+    st.markdown(
+        "Bloomberg-BTCA-style pivot. Pick any **categories** as the grouping columns "
+        "(region, broker, market cap, …) and the table shows **cost (bps) vs each benchmark** "
+        "as value columns."
+        + ("  \n_GTC orders are excluded (sidebar)._" if exclude_gtc else "")
+    )
+
+    cat_labels = list(PIVOT_CATEGORIES.keys())
+    c1, c2, c3 = st.columns([2, 2, 1])
+    sel_cat_labels = c1.multiselect("Categories (grouping columns)", cat_labels,
+                                    default=["Region", "Broker"])
+    sel_bench = c2.multiselect("Benchmarks (value columns)", list(BENCHMARK_COLS.keys()),
+                               default=["Arrival", "Interval VWAP"])
+    stat = c3.selectbox("Statistic", ["Value-weighted", "Mean", "Median"], index=0)
+    min_n = st.slider("Minimum orders per row", 1, 40, 5, key="btca_minn")
+
+    categories = [PIVOT_CATEGORIES[l] for l in sel_cat_labels]
+    if not categories or not sel_bench:
+        st.info("Pick at least one category and one benchmark.")
+    else:
+        piv = btca_pivot(clean, categories, sel_bench, stat=stat, min_n=min_n)
+        if piv.empty:
+            st.warning(f"No group has ≥ {min_n} orders.")
+        else:
+            bench_cols = [f"{b} cost (bps)" for b in sel_bench]
+            pretty = piv.rename(columns={c: l for l, c in PIVOT_CATEGORIES.items()})
+
+            def _color_cost(v):  # red = cost (+), teal = improvement (−); no matplotlib needed
+                if not isinstance(v, (int, float)) or pd.isna(v):
+                    return ""
+                a = 0.12 + 0.55 * min(abs(v) / 50.0, 1.0)
+                rgb = "166,70,47" if v > 0 else "46,111,99"
+                return f"background-color: rgba({rgb},{a:.2f})"
+
+            _style_df = pretty.style.format({c: "{:,.1f}" for c in bench_cols})
+            # pandas ≥2.1 renamed Styler.applymap → Styler.map; support both
+            _elem = getattr(_style_df, "map", None) or _style_df.applymap
+            styled = _elem(_color_cost, subset=bench_cols)
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+            st.caption(f"{stat} cost, positive = cost. Last row = ALL (book total). "
+                       "Colour scale ±50 bps (red = costlier). Cost is FX-neutral (bps ratio); "
+                       "value-weighting uses **FX-converted USD notional** so mixed-currency groups "
+                       "aren't dominated by JPY/GBp.")
+
+            # heatmap when exactly one category and ≥1 benchmark
+            body = piv[piv[categories[0]] != "ALL"] if categories else piv
+            if len(categories) == 1 and not body.empty:
+                melt = body.melt(id_vars=categories, value_vars=bench_cols,
+                                 var_name="benchmark", value_name="cost")
+                fig = px.bar(melt, x=categories[0], y="cost", color="benchmark", barmode="group",
+                             color_discrete_sequence=[GOLD, TEAL, SLATE])
+                st.plotly_chart(_style(fig, ytitle="cost (bps, +=cost)"), use_container_width=True)
+
+            csv = piv.to_csv(index=False).encode("utf-8")
+            st.download_button("Download pivot (CSV)", csv, "btca_pivot.csv", "text/csv")
+
+    st.caption("Open benchmark is a **diagnostic** — Open/Low/High are an export snapshot, so its "
+               "column is noisy; rely on Arrival and Interval VWAP.")
+
+# ===========================================================================
 # Arrival IS
 # ===========================================================================
 with TABS[T_ARRIVAL]:
@@ -461,8 +534,8 @@ with TABS[T_ARRIVAL]:
     st.markdown("#### Broker breakdown — value-weighted arrival cost")
     bd = (view.groupby("brkr_code").apply(
             lambda g: pd.Series({
-                "cost_bps": np.average(g["slippage_bps"], weights=g["notional_local"].abs())
-                if g["notional_local"].abs().sum() > 0 else np.nan,
+                "cost_bps": np.average(g["slippage_bps"], weights=g["notional_usd"])
+                if g["notional_usd"].sum() > 0 else np.nan,
                 "n_orders": len(g)}), include_groups=False)
           .reset_index())
     st.plotly_chart(hbar(bd, "brkr_code", "cost_bps", "value-weighted slippage (bps)"), use_container_width=True)

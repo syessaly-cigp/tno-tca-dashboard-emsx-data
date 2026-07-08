@@ -31,6 +31,9 @@ from .tca_model import (
 from .segments import (
     add_segments,
     cost_stats,
+    btca_pivot,
+    BENCHMARK_COLS,
+    PIVOT_CATEGORIES,
     MKTCAP_DEFS,
     ADV_DEFS,
     SPREAD_DEFS,

@@ -51,7 +51,9 @@ class PipelineArtifacts:
 
 
 def run_parent_pipeline(
-    parent_csv: str | Path, child_csv: str | Path | None = None
+    parent_csv: str | Path,
+    child_csv: str | Path | None = None,
+    exclude_gtc: bool = False,
 ) -> PipelineArtifacts:
     raw_parent = load_parent_orders(parent_csv)
 
@@ -62,6 +64,9 @@ def run_parent_pipeline(
     child = clean_child_orders(raw_child) if len(raw_child) else pd.DataFrame()
 
     clean = clean_parent_orders(raw_parent, child if len(child) else None)
+    if exclude_gtc:
+        # drop Good-Till-Cancelled orders and re-run everything on the remainder
+        clean = clean.loc[~clean["is_gtc"]].reset_index(drop=True)
     quality, reasons = build_data_quality_report(clean)
     headline = value_weighted_summary(clean)
 

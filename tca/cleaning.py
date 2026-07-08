@@ -214,7 +214,9 @@ def clean_parent_orders(
     df["slippage_bps"] = _slip_bps(df["avg_px"], df["arr_px"], sf)       # PRIMARY (IS)
     df["slippage_vwap_bps"] = _slip_bps(df["avg_px"], df["interval_vwap"], sf)
     df["slippage_open_bps"] = _slip_bps(df["avg_px"], df["open_px"], sf)  # diagnostic only
-    df["cost_bps"] = -df["slippage_bps"]                                  # positive = cost
+    df["cost_bps"] = -df["slippage_bps"]                                  # positive = cost (vs arrival)
+    df["cost_vwap_bps"] = -df["slippage_vwap_bps"]                        # positive = cost (vs interval VWAP)
+    df["cost_open_bps"] = -df["slippage_open_bps"]                        # positive = cost (vs open, diagnostic)
     df["slippage_cash_local"] = (df["avg_px"] - df["arr_px"]) * df["fill_qty"] * sf
     df["notional_local"] = df["fill_qty"] * df["arr_px"]
 
@@ -247,7 +249,8 @@ def clean_parent_orders(
     )
     df["flag_extreme_adv"] = df["qty_pct_adv_20d"] > 100.0
     span = df["create_time"].dt.normalize() != df["trade_date"].dt.normalize()
-    df["flag_multi_day_gtc"] = df["tif"].str.upper().str.contains("GTC", na=False) & span.fillna(False)
+    df["is_gtc"] = df["tif"].astype(str).str.upper().str.contains("GTC", na=False)
+    df["flag_multi_day_gtc"] = df["is_gtc"] & span.fillna(False)
     df["flag_missing_core"] = (
         df["arr_px"].isna() | df["avg_px"].isna() | df["fill_qty"].isna()
         | df["side"].eq("") | df["brkr_code"].eq("") | df["exch_code"].eq("")

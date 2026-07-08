@@ -93,7 +93,7 @@ def cost_surprise_by(clean_df: pd.DataFrame, group_col: str, min_n: int = 5) -> 
     for key, g in df.groupby(group_col, dropna=False):
         if len(g) < min_n:
             continue
-        w = g["notional_local"].abs()
+        w = g["notional_usd"]
         wv = lambda s: float(np.average(s, weights=w)) if w.sum() > 0 else float("nan")
         rows.append({
             group_col: key,

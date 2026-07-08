@@ -37,7 +37,7 @@ def value_weighted_summary(clean_df: pd.DataFrame) -> HeadlineSummary:
     if n == 0:
         return HeadlineSummary(0, 0, *([float("nan")] * 5), False)
 
-    notional = df["notional_local"].abs()
+    notional = df["notional_usd"]
     fp = df.loc[df["has_footprint"]]
     footprint_mean_cost = float(fp["cost_bps"].mean()) if len(fp) else float("nan")
     vw_arr = _vw(df["slippage_bps"], notional)
@@ -68,7 +68,7 @@ def attribution_summary(clean_df: pd.DataFrame, footprint_only: bool = True) -> 
     df = df.dropna(subset=["exec_vwap_bps", "timing_bps", "slippage_bps"])
     if footprint_only:
         df = df.loc[df["has_footprint"]]
-    w = df["notional_local"].abs()
+    w = df["notional_usd"]
     return {
         "n": int(len(df)),
         "execution_vs_vwap_bps": _vw(df["exec_vwap_bps"], w),
@@ -102,7 +102,7 @@ def attribution_by(
     for key, g in df.groupby(group_col, dropna=False):
         if len(g) < min_n:
             continue
-        w = g["notional_local"].abs()
+        w = g["notional_usd"]
         rows.append(
             {
                 group_col: key,
@@ -196,7 +196,7 @@ def cost_by_participation(clean_df: pd.DataFrame, footprint_only: bool = True) -
     df["pov_bucket"] = pd.cut(df["day_part_rate"].clip(upper=100), bins=bins, labels=labels, include_lowest=True)
     rows = []
     for b, g in df.groupby("pov_bucket", observed=True):
-        w = g["notional_local"].abs()
+        w = g["notional_usd"]
         wv = lambda s: float(np.average(s, weights=w)) if w.sum() > 0 else float("nan")
         rows.append({
             "pov_bucket": str(b),

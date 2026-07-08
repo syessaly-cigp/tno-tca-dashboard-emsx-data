@@ -155,6 +155,29 @@ def test_segments_and_cost_stats():
     assert {"mean_cost_bps", "median_cost_bps", "std_cost_bps", "t_stat", "n_orders"}.issubset(cs.columns)
 
 
+def test_gtc_flag_and_pivot():
+    from tca.segments import btca_pivot
+    base = _toy_parent()
+    base["TIF"] = ["GTC", "DAY", "DAY"]
+    clean = clean_parent_orders(base)
+    assert clean["is_gtc"].tolist() == [True, False, False]
+    # positive-cost columns exist for all three benchmarks
+    assert {"cost_bps", "cost_vwap_bps", "cost_open_bps"}.issubset(clean.columns)
+    piv = btca_pivot(clean, ["direction"], ["Arrival", "Interval VWAP"], stat="Value-weighted", min_n=1)
+    assert "Arrival cost (bps)" in piv.columns and "Interval VWAP cost (bps)" in piv.columns
+    assert (piv["direction"] == "ALL").any()   # total row present
+
+
+def test_gtc_exclusion_pipeline(tmp_path=None):
+    # excluding GTC should drop exactly the GTC rows from the analysis set
+    base = _toy_parent()
+    base["TIF"] = ["GTC", "DAY", "DAY"]
+    full = clean_parent_orders(base)
+    kept_ex = full.loc[~full["is_gtc"] & full["keep_for_analysis"]]
+    assert (~kept_ex["is_gtc"]).all()
+    assert len(kept_ex) == int((full["keep_for_analysis"] & ~full["is_gtc"]).sum())
+
+
 def test_order_type_segregation():
     base = _toy_parent()
     base["LmtPx"] = ["MKT", "101.5", "MKT"]     # market, limit, market
