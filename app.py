@@ -19,7 +19,7 @@ import streamlit as st
 from tca.pipeline import run_parent_pipeline
 from tca.insights import attribution_summary
 from tca.segments import (
-    cost_stats, btca_pivot, BENCHMARK_COLS, PIVOT_CATEGORIES,
+    cost_stats, btca_pivot, arrival_vwap_trend_scan, BENCHMARK_COLS, PIVOT_CATEGORIES,
     MKTCAP_DEFS, ADV_DEFS, SPREAD_DEFS,
     MKTCAP_ORDER, ADV_ORDER, SPREAD_ORDER,
 )
@@ -224,6 +224,35 @@ with TABS[T_OVERVIEW]:
         ("VW cost vs arrival", f"{_fmt(h.value_weighted_slippage_bps)} bps", "Value-weighted Implementation Shortfall"),
         ("VW cost vs VWAP", f"{_fmt(h.vwap_value_weighted_bps)} bps", "Drift-free execution cross-check"),
     ])
+
+    # ---- auto-generated Trends panel (Arrival vs VWAP gap scan) --------------------
+    st.markdown("#### Trends — Arrival vs VWAP (auto-generated)")
+    st.caption("Market orders, GTC-excluded. Positive = cost; value-weighted (FX-USD). "
+               "Gap = Arrival − VWAP ≈ timing drift. Only cells that clear min-n, are significant "
+               "(|t| ≥ 2) and aren't single-ticket artefacts are shown. Honours the currency filter.")
+    trend_min = st.slider("Minimum orders per cell", 15, 60, 25, key="ov_trend_minn")
+    tsrc = clean if not sel_ccy else clean[clean["currency"].isin(sel_ccy)]
+    scan = arrival_vwap_trend_scan(tsrc, min_n=trend_min)
+    robust = scan[scan["robust"]] if not scan.empty else scan
+    if robust.empty:
+        st.warning("No robust trend at this minimum sample / filter — loosen min-n or clear the filter.")
+    else:
+        for _, r in robust.head(8).iterrows():
+            st.markdown(
+                f"- **{r['segment']}** — Arrival **{r['A_vw']:+.1f}** / VWAP **{r['V_vw']:+.1f}** bps "
+                f"(gap {r['gap_vw']:+.1f}), n={int(r['n'])}, t={r['A_t']:+.1f}  →  _{r['read']}_"
+            )
+        top = robust.head(6).iloc[::-1]
+        melt = top.melt(id_vars=["segment"], value_vars=["A_vw", "V_vw"],
+                        var_name="benchmark", value_name="bps")
+        melt["benchmark"] = melt["benchmark"].map({"A_vw": "vs Arrival", "V_vw": "vs VWAP"})
+        fig = px.bar(melt, x="bps", y="segment", color="benchmark", orientation="h",
+                     barmode="group", color_discrete_sequence=[GOLD, TEAL])
+        st.plotly_chart(_style(fig, height=320, xtitle="cost (bps, +=cost)"), use_container_width=True)
+        with st.expander("All screened cells (incl. non-robust)"):
+            st.dataframe(scan.round(1)[["segment", "n", "A_vw", "V_vw", "gap_vw", "A_t", "V_t", "read", "robust"]],
+                         use_container_width=True, hide_index=True)
+
     st.markdown("#### Framework comparison — value-weighted cost of the book (bps)")
     comp = pd.DataFrame({
         "framework": ["Arrival IS", "Interval VWAP", "Bloomberg TCA(20%) est.", "Execution vs VWAP", "Timing drift"],
@@ -241,9 +270,9 @@ with TABS[T_OVERVIEW]:
     fig.update_layout(coloraxis_showscale=False)
     st.plotly_chart(_style(fig, ytitle="bps (neg = cost)"), use_container_width=True)
     st.info(
-        "Each downstream tab is one framework in this comparison, with its formula, assumptions, "
-        "validity, and a **broker breakdown**. Bloomberg's TCA is shown as a cost (negated) for "
-        "comparability — it is an *ex-ante estimate*, the others are *realized*."
+        "Arrival IS and Interval VWAP are the realized benchmarks; **Bloomberg TCA(20%)** is an "
+        "ex-ante estimate (negated for comparability). **Execution vs VWAP** and **timing drift** "
+        "decompose arrival cost into controllable skill vs market drift."
     )
     st.markdown("#### Currency mix")
     cc = pd.Series(q.currency_counts).sort_values(ascending=False).reset_index()

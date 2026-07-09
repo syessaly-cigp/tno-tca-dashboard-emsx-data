@@ -31,6 +31,7 @@ from .tca_model import (
 from .segments import (
     add_segments,
     cost_stats,
+    arrival_vwap_trend_scan,
     btca_pivot,
     BENCHMARK_COLS,
     PIVOT_CATEGORIES,

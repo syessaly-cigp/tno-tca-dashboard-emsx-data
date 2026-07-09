@@ -194,6 +194,71 @@ def btca_pivot(
     return out
 
 
+_TREND_CUTS = [
+    ("Direction", ["direction"]),
+    ("Spread×Dir", ["spread_bucket", "direction"]),
+    ("ADV%×Dir", ["adv_group", "direction"]),
+    ("Cap×Dir", ["mktcap_group", "direction"]),
+    ("Region×Dir", ["region", "direction"]),
+    ("Broker×Dir", ["brkr_code", "direction"]),
+    ("Region×Broker", ["region", "brkr_code"]),
+]
+
+
+def _tstat(s: pd.Series) -> float:
+    s = s.dropna()
+    n = len(s)
+    sd = s.std(ddof=1)
+    return float(s.mean() / (sd / np.sqrt(n))) if (n > 1 and sd and sd > 0) else float("nan")
+
+
+def arrival_vwap_trend_scan(
+    clean_df: pd.DataFrame, min_n: int = 25, tstat_min: float = 2.0, market_only: bool = True
+) -> pd.DataFrame:
+    """Scan category cuts for Arrival-vs-VWAP cost cells and flag robust trends.
+
+    Per cell: n, value-weighted (FX-USD) & mean cost vs Arrival (A) and vs interval VWAP (V),
+    t-stats, gap A−V (= timing drift). A cell is `robust` when it clears min_n, is significant
+    (|t| ≥ tstat_min on A or V) and value-weighted & mean agree in sign (not a single-ticket
+    artefact). `read` classifies execution (from V) and drift (from the gap). Positive = cost.
+    """
+    df = clean_df.loc[clean_df["keep_for_analysis"]].copy()
+    if market_only and "order_type" in df.columns:
+        df = df[df["order_type"] == "Market"]
+
+    def _vw(s, w):
+        m = s.notna()
+        return float(np.average(s[m], weights=w[m])) if (m.sum() and w[m].sum() > 0) else float("nan")
+
+    rows = []
+    for cut_name, by in _TREND_CUTS:
+        d = df.dropna(subset=by)
+        for key, g in d.groupby(by, observed=True, dropna=True):
+            n = len(g)
+            if n < min_n:
+                continue
+            w = g["notional_usd"]
+            A, V = g["cost_bps"], g["cost_vwap_bps"]
+            a_vw, v_vw = _vw(A, w), _vw(V, w)
+            a_mean, v_mean = float(A.mean()), float(V.mean())
+            a_t, v_t = _tstat(A), _tstat(V)
+            gap = a_vw - v_vw
+            exe = "exec worse" if v_vw > 5 else ("exec beat mkt" if v_vw < -5 else "exec ~ mkt")
+            dft = "adverse drift" if gap > 5 else ("favorable drift" if gap < -5 else "no drift")
+            sig = (abs(a_t) >= tstat_min) or (abs(v_t) >= tstat_min)
+            concentrated = np.isfinite(a_vw) and np.isfinite(a_mean) and (np.sign(a_vw) != np.sign(a_mean))
+            label = " / ".join(str(x) for x in (key if isinstance(key, tuple) else (key,)))
+            rows.append({
+                "cut": cut_name, "segment": f"{cut_name}: {label}", "n": n,
+                "A_vw": a_vw, "V_vw": v_vw, "gap_vw": gap, "A_t": a_t, "V_t": v_t,
+                "read": f"{exe} | {dft}", "robust": bool(sig and not concentrated),
+            })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values("A_vw", key=lambda s: s.abs(), ascending=False).reset_index(drop=True)
+
+
 def cost_stats(clean_df: pd.DataFrame, by: list[str], min_n: int = 5) -> pd.DataFrame:
     """Per-group arrival-cost stats (positive = cost): n, mean, median, std, t-stat, VW mean.
 
