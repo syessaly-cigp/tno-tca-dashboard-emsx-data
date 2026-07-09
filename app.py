@@ -248,10 +248,10 @@ with TABS[T_OVERVIEW]:
         melt["benchmark"] = melt["benchmark"].map({"A_vw": "vs Arrival", "V_vw": "vs VWAP"})
         fig = px.bar(melt, x="bps", y="segment", color="benchmark", orientation="h",
                      barmode="group", color_discrete_sequence=[GOLD, TEAL])
-        st.plotly_chart(_style(fig, height=320, xtitle="cost (bps, +=cost)"), use_container_width=True)
+        st.plotly_chart(_style(fig, height=320, xtitle="cost (bps, +=cost)"), width='stretch')
         with st.expander("All screened cells (incl. non-robust)"):
             st.dataframe(scan.round(1)[["segment", "n", "A_vw", "V_vw", "gap_vw", "A_t", "V_t", "read", "robust"]],
-                         use_container_width=True, hide_index=True)
+                         width='stretch', hide_index=True)
 
     st.markdown("#### Framework comparison — value-weighted cost of the book (bps)")
     comp = pd.DataFrame({
@@ -268,7 +268,7 @@ with TABS[T_OVERVIEW]:
                  color_continuous_scale=[CLAY, "#fee2e2", "#dcfce7", TEAL], color_continuous_midpoint=0,
                  text=comp["bps"].round(1))
     fig.update_layout(coloraxis_showscale=False)
-    st.plotly_chart(_style(fig, ytitle="bps (neg = cost)"), use_container_width=True)
+    st.plotly_chart(_style(fig, ytitle="bps (neg = cost)"), width='stretch')
     st.info(
         "Arrival IS and Interval VWAP are the realized benchmarks; **Bloomberg TCA(20%)** is an "
         "ex-ante estimate (negated for comparability). **Execution vs VWAP** and **timing drift** "
@@ -278,7 +278,7 @@ with TABS[T_OVERVIEW]:
     cc = pd.Series(q.currency_counts).sort_values(ascending=False).reset_index()
     cc.columns = ["currency", "orders"]
     st.plotly_chart(_style(px.bar(cc, x="currency", y="orders", color_discrete_sequence=[GOLD]), height=300),
-                    use_container_width=True)
+                    width='stretch')
 
 # ===========================================================================
 # EDA — exploratory data analysis
@@ -308,7 +308,7 @@ with TABS[T_EDA]:
         else:
             fig = px.histogram(d, nbins=40, color_discrete_sequence=[GOLD])
             fig.update_xaxes(title=lab)
-        cols[i % 3].plotly_chart(_style(fig, height=260), use_container_width=True)
+        cols[i % 3].plotly_chart(_style(fig, height=260), width='stretch')
 
     st.markdown("#### Category mix")
     cat_specs = [("region", "Region"), ("mktcap_group", "Market-cap group"),
@@ -319,7 +319,7 @@ with TABS[T_EDA]:
         vc = eda[col].value_counts(dropna=False).reset_index()
         vc.columns = [lab, "orders"]
         fig = px.bar(vc, x=lab, y="orders", color_discrete_sequence=[GOLD_DK])
-        ccols[i % 3].plotly_chart(_style(fig, height=260), use_container_width=True)
+        ccols[i % 3].plotly_chart(_style(fig, height=260), width='stretch')
 
     c1, c2 = st.columns([1, 1])
     with c1:
@@ -330,7 +330,7 @@ with TABS[T_EDA]:
             "field": cov_fields,
             "coverage_%": [round(100 * eda[f].notna().mean(), 1) for f in cov_fields],
         }).sort_values("coverage_%")
-        st.dataframe(cov, use_container_width=True, hide_index=True)
+        st.dataframe(cov, width='stretch', hide_index=True)
     with c2:
         st.markdown("#### Driver correlations")
         corr_cols = ["cost_bps_w", "spread_bps", "qty_pct_adv_20d", "day_part_rate",
@@ -338,7 +338,7 @@ with TABS[T_EDA]:
         cm = eda[corr_cols].replace([np.inf, -np.inf], np.nan).corr()
         fig = px.imshow(cm, text_auto=".2f", color_continuous_scale=[CLAY, "#f4f1e9", TEAL],
                         zmin=-1, zmax=1, aspect="auto")
-        st.plotly_chart(_style(fig, height=300), use_container_width=True)
+        st.plotly_chart(_style(fig, height=300), width='stretch')
 
 # ===========================================================================
 # Market-Order TCA framework (segmented)
@@ -386,9 +386,9 @@ with TABS[T_MOTCA]:
     with sc1:
         fig = px.bar(seg, x="order_type", y="n_orders", color="order_type",
                      color_discrete_sequence=[GOLD, SLATE, BURG], text="n_orders")
-        st.plotly_chart(_style(fig, height=280, ytitle="orders"), use_container_width=True)
+        st.plotly_chart(_style(fig, height=280, ytitle="orders"), width='stretch')
     with sc2:
-        st.dataframe(seg.round(2), use_container_width=True, hide_index=True)
+        st.dataframe(seg.round(2), width='stretch', hide_index=True)
     st.caption("Market orders (`LmtPx = MKT`) are the framework's population. Limit orders are segregated "
                "out — their opportunity cost is a separate study (see Future Analysis).")
 
@@ -414,7 +414,7 @@ with TABS[T_MOTCA]:
                              values="n", color="cost", color_continuous_scale=[TEAL, "#f4f1e9", CLAY],
                              color_continuous_midpoint=0)
             st.plotly_chart(_style(fig, height=420).update_layout(margin=dict(t=30, l=10, r=10, b=10)),
-                            use_container_width=True)
+                            width='stretch')
             st.caption("Book segregated Region → Market-cap → Direction. Box size = order count, "
                        "colour = mean cost (red = costlier, teal = cheaper).")
 
@@ -438,12 +438,12 @@ with TABS[T_MOTCA]:
         fig = px.bar(stats, x=primary, y="mean_cost_bps", color=color, barmode="group",
                      color_discrete_sequence=[GOLD, TEAL, SLATE, BURG],
                      category_orders=cat_orders, hover_data=["n_orders", "t_stat", "median_cost_bps"])
-        st.plotly_chart(_style(fig, ytitle="mean cost (bps, +=cost)"), use_container_width=True)
+        st.plotly_chart(_style(fig, ytitle="mean cost (bps, +=cost)"), width='stretch')
         st.caption("|t-stat| ≳ 2 ⇒ the group's mean cost is statistically different from zero.")
         show = stats.copy()
         for c in ["mean_cost_bps", "median_cost_bps", "std_cost_bps", "t_stat", "vw_cost_bps"]:
             show[c] = show[c].round(2)
-        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.dataframe(show, width='stretch', hide_index=True)
         sig = stats.loc[stats["t_stat"].abs() >= 2].sort_values("mean_cost_bps", ascending=False)
         if not sig.empty:
             top = sig.iloc[0]
@@ -505,7 +505,7 @@ with TABS[T_BTCA]:
             # pandas ≥2.1 renamed Styler.applymap → Styler.map; support both
             _elem = getattr(_style_df, "map", None) or _style_df.applymap
             styled = _elem(_color_cost, subset=bench_cols)
-            st.dataframe(styled, use_container_width=True, hide_index=True)
+            st.dataframe(styled, width='stretch', hide_index=True)
             st.caption(f"{stat} cost, positive = cost. Last row = ALL (book total). "
                        "Colour scale ±50 bps (red = costlier). Cost is FX-neutral (bps ratio); "
                        "value-weighting uses **FX-converted USD notional** so mixed-currency groups "
@@ -518,7 +518,7 @@ with TABS[T_BTCA]:
                                  var_name="benchmark", value_name="cost")
                 fig = px.bar(melt, x=categories[0], y="cost", color="benchmark", barmode="group",
                              color_discrete_sequence=[GOLD, TEAL, SLATE])
-                st.plotly_chart(_style(fig, ytitle="cost (bps, +=cost)"), use_container_width=True)
+                st.plotly_chart(_style(fig, ytitle="cost (bps, +=cost)"), width='stretch')
 
             csv = piv.to_csv(index=False).encode("utf-8")
             st.download_button("Download pivot (CSV)", csv, "btca_pivot.csv", "text/csv")
